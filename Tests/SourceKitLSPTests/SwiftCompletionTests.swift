@@ -48,6 +48,10 @@ final class SwiftCompletionTests: SourceKitLSPTestCase {
     )
   )
 
+  private var extendedCompletionItemsCapabilities = ClientCapabilities(
+    experimental: ["sourcekit-lsp.completion.extendedItems": ["supported": true]]
+  )
+
   // MARK: - Tests
 
   func testCompletionBasic() async throws {
@@ -180,6 +184,69 @@ final class SwiftCompletionTests: SourceKitLSPTestCase {
       return XCTFail("Expected completion item data to be a dictionary")
     }
     XCTAssertNotNil(data["semanticScore"], "Expected the raw semanticScore to be carried on completion item data")
+  }
+
+  func testCompletionExtendedItems() async throws {
+    try await SkipUnless.sourcekitdSupportsPlugin()
+
+    let source = """
+      struct S {
+        var members: Set<Int>
+        func test(i: Int) {
+          self.1️⃣
+          i.2️⃣
+        }
+      }
+      """
+
+    let testClient = try await TestSourceKitLSPClient(capabilities: extendedCompletionItemsCapabilities)
+    let uri = DocumentURI(for: .swift)
+    let positions = testClient.openDocument(source, uri: uri)
+
+    // A member whose type is a generic (`Set<Int>`) exercises the XML entity round-trip: the annotated description
+    // escapes `<`/`>` as entities, so a correct reconstruction yields `Set<Int>`, not `Set&lt;Int&gt;`.
+    let selfDot = try await testClient.send(
+      CompletionRequest(textDocument: TextDocumentIdentifier(uri), position: positions["1️⃣"])
+    )
+    let members = try XCTUnwrap(selfDot.items.first { $0.label == "members" })
+    XCTAssertEqual(members.label, "members")
+    XCTAssertEqual(members.detail, "Set<Int>")
+
+    let membersData = try XCTUnwrap(
+      SourceKitCompletionItemData(fromLSPAny: members.data),
+      "Expected extended completion metadata on the completion item data"
+    )
+    let annotatedDescription = try XCTUnwrap(
+      membersData.annotatedDescription,
+      "Expected annotatedDescription XML on the completion item data"
+    )
+    XCTAssertTrue(annotatedDescription.contains("<name>"), "Expected annotated XML, got: \(annotatedDescription)")
+    XCTAssertNotNil(membersData.annotatedTypeName, "Expected annotatedTypeName on the completion item data")
+    XCTAssertNotNil(membersData.isSystem, "Expected isSystem on the completion item data")
+    XCTAssertNotNil(membersData.hasDiagnostic, "Expected hasDiagnostic on the completion item data")
+
+    // A standard-library member carries its module name and system flag.
+    let intDot = try await testClient.send(
+      CompletionRequest(textDocument: TextDocumentIdentifier(uri), position: positions["2️⃣"])
+    )
+    let magnitude = try XCTUnwrap(intDot.items.first { $0.label == "magnitude" })
+    let magnitudeData = try XCTUnwrap(SourceKitCompletionItemData(fromLSPAny: magnitude.data))
+    XCTAssertEqual(magnitudeData.module, "Swift")
+    XCTAssertEqual(magnitudeData.isSystem, true)
+
+    // Without the capability, the metadata and annotated XML are omitted and the label/detail stay plain.
+    let plainClient = try await TestSourceKitLSPClient()
+    let plainUri = DocumentURI(for: .swift)
+    let plainPositions = plainClient.openDocument(source, uri: plainUri)
+    let plainSelfDot = try await plainClient.send(
+      CompletionRequest(textDocument: TextDocumentIdentifier(plainUri), position: plainPositions["1️⃣"])
+    )
+    let plainMembers = try XCTUnwrap(plainSelfDot.items.first { $0.label == "members" })
+    XCTAssertEqual(plainMembers.label, "members")
+    XCTAssertEqual(plainMembers.detail, "Set<Int>")
+    let plainData = SourceKitCompletionItemData(fromLSPAny: plainMembers.data)
+    XCTAssertNil(plainData?.module, "Did not expect module without the extended-items capability")
+    XCTAssertNil(plainData?.annotatedDescription, "Did not expect annotated XML without the capability")
   }
 
   func testCompletionSnippetSupport() async throws {

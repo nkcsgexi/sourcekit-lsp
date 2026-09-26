@@ -39,6 +39,7 @@ extension SwiftLanguageService {
       requestContext: requestContext,
       compileCommand: compileCommand,
       clientCapabilities: capabilityRegistry.clientCapabilities,
+      clientSupportsExtendedCompletionItems: capabilityRegistry.clientSupportsExtendedCompletionItems,
       filterText: filterText
     )
   }

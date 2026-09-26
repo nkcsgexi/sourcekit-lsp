@@ -60,13 +60,15 @@ struct CompletionItemData: Codable, LSPAnyCodable {
   let itemId: Int
   /// sourcekitd's `key.semantic_score`
   let semanticScore: Double?
+}
 
-  init(uri: DocumentURI, sessionId: CompletionSessionID, itemId: Int, semanticScore: Double?) {
-    self.uri = uri
-    self.sessionId = sessionId
-    self.itemId = itemId
-    self.semanticScore = semanticScore
-  }
+/// Merges the resolve data and the opted-in `SourceKitCompletionItemData` into a single flat `CompletionItem.data`
+/// dictionary (their keys don't overlap), so both can be decoded from it independently. A `.null` operand — an
+/// item with no resolve identifier, or a client that didn't opt in — contributes nothing.
+private func mergedCompletionItemData(_ lhs: LSPAny, _ rhs: LSPAny) -> LSPAny {
+  guard case .dictionary(let lhs) = lhs else { return rhs }
+  guard case .dictionary(let rhs) = rhs else { return .dictionary(lhs) }
+  return .dictionary(lhs.merging(rhs) { _, new in new })
 }
 
 /// Represents a code-completion session for a given source location that can be efficiently
@@ -146,6 +148,7 @@ class CodeCompletionSession {
     requestContext: CompletionRequestContext,
     compileCommand: SwiftCompileCommand?,
     clientCapabilities: ClientCapabilities,
+    clientSupportsExtendedCompletionItems: Bool,
     filterText: String
   ) async throws -> CompletionList {
     let task = completionQueue.asyncThrowing {
@@ -174,7 +177,8 @@ class CodeCompletionSession {
         indentationWidth: indentationWidth,
         position: completionPosition,
         compileCommand: compileCommand,
-        clientCapabilities: clientCapabilities
+        clientCapabilities: clientCapabilities,
+        clientSupportsExtendedCompletionItems: clientSupportsExtendedCompletionItems
       )
       completionSessions[ObjectIdentifier(sourcekitd)] = session
       return try await session.open(filterText: filterText, requestContext: requestContext, in: snapshot)
@@ -231,6 +235,7 @@ class CodeCompletionSession {
   private let clientSupportsSnippets: Bool
   private let clientSupportsInsertReplaceEdits: Bool
   private let clientSupportsDocumentationResolve: Bool
+  private let clientSupportsExtendedCompletionItems: Bool
   private var state: State = .closed
 
   private enum State {
@@ -248,7 +253,8 @@ class CodeCompletionSession {
     indentationWidth: Trivia?,
     position: Position,
     compileCommand: SwiftCompileCommand?,
-    clientCapabilities: ClientCapabilities
+    clientCapabilities: ClientCapabilities,
+    clientSupportsExtendedCompletionItems: Bool
   ) {
     self.id = CompletionSessionID.next()
     self.sourcekitd = sourcekitd
@@ -263,6 +269,7 @@ class CodeCompletionSession {
     self.clientSupportsDocumentationResolve =
       clientCapabilities.textDocument?.completion?.completionItem?.resolveSupport?.properties.contains("documentation")
       ?? false
+    self.clientSupportsExtendedCompletionItems = clientSupportsExtendedCompletionItems
   }
 
   private func open(
@@ -347,6 +354,9 @@ class CodeCompletionSession {
       keys.filterText: filterText,
       keys.requestLimit: 200,
       keys.useNewAPI: 1,
+      // When the client opts in to extended completion items, request annotated-description XML for the label and
+      // type name so we can surface it (and reconstruct the plain label/detail from it).
+      keys.annotatedDescription: clientSupportsExtendedCompletionItems ? 1 : 0,
     ])
     return dict
   }
@@ -467,15 +477,28 @@ class CodeCompletionSession {
     let keys = sourcekitd.keys
 
     var completionItems = completions.compactMap { (value: SKDResponseDictionary) -> CompletionItem? in
-      guard let name: String = value[keys.description],
+      guard var name: String = value[keys.description],
         var insertText: String = value[keys.sourceText]
       else {
         return nil
       }
 
       var filterName: String? = value[keys.name]
-      let typeName: String? = value[sourcekitd.keys.typeName]
+      var typeName: String? = value[sourcekitd.keys.typeName]
       let utf8CodeUnitsToErase: Int = value[sourcekitd.keys.numBytesToErase] ?? 0
+
+      // When the client opted in to extended completion items, the label (`key.description`) and type name are
+      // annotated-description XML instead of plain text (the plugin swaps them out when we request annotation). Keep
+      // the XML to attach to the item's data and reconstruct the plain label/detail from it, before any downstream use
+      // of `name`, so sorting, snippet detection, and the argument-list heuristics keep operating on plain text.
+      var annotatedDescription: String?
+      var annotatedTypeName: String?
+      if clientSupportsExtendedCompletionItems {
+        annotatedDescription = name
+        annotatedTypeName = typeName
+        name = plainText(fromAnnotatedCompletionXML: name)
+        typeName = typeName.map { plainText(fromAnnotatedCompletionXML: $0) }
+      }
 
       if let closureExpanded = expandClosurePlaceholders(insertText: insertText) {
         insertText = closureExpanded
@@ -606,6 +629,26 @@ class CodeCompletionSession {
         sortText = nil
       }
 
+      // The per-item metadata that opted-in clients requested, encoded flat alongside the resolve data below so it
+      // can be decoded straight from `CompletionItem.data`. Left nil (and thus omitted) for other clients.
+      let sourcekitData: SourceKitCompletionItemData?
+      if clientSupportsExtendedCompletionItems {
+        let module: String? = value[keys.moduleName]
+        let groupID: Int? = value[keys.groupId]
+        let isSystem: Bool? = value[keys.isSystem]
+        let hasDiagnostic: Bool? = value[keys.hasDiagnostic]
+        sourcekitData = SourceKitCompletionItemData(
+          module: module,
+          groupID: groupID,
+          isSystem: isSystem,
+          hasDiagnostic: hasDiagnostic,
+          annotatedDescription: annotatedDescription,
+          annotatedTypeName: annotatedTypeName
+        )
+      } else {
+        sourcekitData = nil
+      }
+
       let data: CompletionItemData? =
         if let identifier: Int = value[keys.identifier] {
           CompletionItemData(
@@ -634,7 +677,7 @@ class CodeCompletionSession {
           insertEnd: insertEnd,
           replaceEnd: replaceEnd
         ),
-        data: data.encodeToLSPAny()
+        data: mergedCompletionItemData(data.encodeToLSPAny(), sourcekitData.encodeToLSPAny())
       )
     }
 
